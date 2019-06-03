@@ -1,77 +1,9 @@
 import traceback
-from .log import reporting
 from .util import admin_command, RemoteError
 
 
-def _remote_run(channel, cmd, **kw):
-    import subprocess
-    import sys
-    from select import select
-    stop_on_nonzero = kw.pop('stop_on_nonzero', True)
-
-    process = subprocess.Popen(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        close_fds=True,
-        **kw
-    )
-
-    while True:
-        reads, _, _ = select(
-            [process.stdout.fileno(), process.stderr.fileno()],
-            [], []
-        )
-
-        for descriptor in reads:
-            if descriptor == process.stdout.fileno():
-                read = process.stdout.readline()
-                if read:
-                    channel.send({'debug': read})
-                    sys.stdout.flush()
-
-            if descriptor == process.stderr.fileno():
-                read = process.stderr.readline()
-                if read:
-                    channel.send({'warning': read})
-                    sys.stderr.flush()
-
-        if process.poll() is not None:
-            # ensure we do not have anything pending in stdout or stderr
-            # unfortunately, we cannot abstract this repetitive loop into its
-            # own function because execnet does not allow for non-global (or
-            # even nested functions). This must be repeated here.
-            while True:
-                err_read = out_read = None
-                for descriptor in reads:
-                    if descriptor == process.stdout.fileno():
-                        out_read = process.stdout.readline()
-                        if out_read:
-                            channel.send({'debug': out_read})
-                            sys.stdout.flush()
-
-                    if descriptor == process.stderr.fileno():
-                        err_read = process.stderr.readline()
-                        if err_read:
-                            channel.send({'warning': err_read})
-                            sys.stderr.flush()
-                # At this point we have gone through all the possible
-                # descriptors and `read` was empty, so we now can break out of
-                # this since all stdout/stderr has been properly flushed to
-                # logging
-                if not err_read and not out_read:
-                    break
-
-            break
-
-    returncode = process.wait()
-    if returncode != 0:
-        if stop_on_nonzero:
-            raise RuntimeError(
-                "command returned non-zero exit status: %s" % returncode
-            )
-        else:
-            channel.send({'warning': "command returned non-zero exit status: %s" % returncode})
+class StopCallback(Exception):
+    pass
 
 
 def extend_env(conn, arguments):
@@ -98,6 +30,16 @@ def extend_env(conn, arguments):
     return arguments
 
 
+def reporting(conn, result, timeout=None):
+    timeout = timeout or conn.global_timeout  # -1 a.k.a. wait for ever
+
+    while True:
+        try:
+            conn.report(result, timeout)
+        except StopCallback:
+            break
+
+
 def run(conn, command, exit=False, timeout=None, **kw):
     """
     A real-time-logging implementation of a remote subprocess.Popen call where
@@ -119,7 +61,7 @@ def run(conn, command, exit=False, timeout=None, **kw):
 
     timeout = timeout or conn.global_timeout
     conn.logger.info('Running command: %s' % ' '.join(admin_command(conn.sudo, command)))
-    result = conn.execute(_remote_run, cmd=command, **kw)
+    result = conn.run(cmd=command, **kw)
     try:
         reporting(conn, result, timeout)
     except Exception:
@@ -136,32 +78,6 @@ def run(conn, command, exit=False, timeout=None, **kw):
             )
     if exit:
         conn.exit()
-
-
-def _remote_check(channel, cmd, **kw):
-    import subprocess
-    stdin = kw.pop('stdin', None)
-    process = subprocess.Popen(
-        cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.PIPE, **kw
-    )
-
-    if stdin:
-        if not isinstance(stdin, bytes):
-            stdin.encode('utf-8', errors='ignore')
-        stdout_stream, stderr_stream = process.communicate(stdin)
-    else:
-        stdout_stream = process.stdout.read()
-        stderr_stream = process.stderr.read()
-
-    try:
-        stdout_stream = stdout_stream.decode('utf-8')
-        stderr_stream = stderr_stream.decode('utf-8')
-    except AttributeError:
-        pass
-
-    stdout = stdout_stream.splitlines()
-    stderr = stderr_stream.splitlines()
-    channel.send((stdout, stderr, process.wait()))
 
 
 def check(conn, command, exit=False, timeout=None, **kw):
@@ -182,7 +98,7 @@ def check(conn, command, exit=False, timeout=None, **kw):
         kw = extend_env(conn, kw)
 
     conn.logger.info('Running command: %s' % ' '.join(admin_command(conn.sudo, command)))
-    result = conn.execute(_remote_check, cmd=command, **kw)
+    result = conn.check(cmd=command, **kw)
     response = None
     try:
         response = result.receive(timeout)

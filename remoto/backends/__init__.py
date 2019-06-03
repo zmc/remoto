@@ -4,7 +4,104 @@ import socket
 import sys
 import execnet
 import logging
-from remoto.process import check
+from remoto.process import check, StopCallback
+
+
+def _remote_run(channel, cmd, **kw):
+    import subprocess
+    import sys
+    from select import select
+    stop_on_nonzero = kw.pop('stop_on_nonzero', True)
+
+    process = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        close_fds=True,
+        **kw
+    )
+
+    while True:
+        reads, _, _ = select(
+            [process.stdout.fileno(), process.stderr.fileno()],
+            [], []
+        )
+
+        for descriptor in reads:
+            if descriptor == process.stdout.fileno():
+                read = process.stdout.readline()
+                if read:
+                    channel.send({'debug': read})
+                    sys.stdout.flush()
+
+            if descriptor == process.stderr.fileno():
+                read = process.stderr.readline()
+                if read:
+                    channel.send({'warning': read})
+                    sys.stderr.flush()
+
+        if process.poll() is not None:
+            # ensure we do not have anything pending in stdout or stderr
+            # unfortunately, we cannot abstract this repetitive loop into its
+            # own function because execnet does not allow for non-global (or
+            # even nested functions). This must be repeated here.
+            while True:
+                err_read = out_read = None
+                for descriptor in reads:
+                    if descriptor == process.stdout.fileno():
+                        out_read = process.stdout.readline()
+                        if out_read:
+                            channel.send({'debug': out_read})
+                            sys.stdout.flush()
+
+                    if descriptor == process.stderr.fileno():
+                        err_read = process.stderr.readline()
+                        if err_read:
+                            channel.send({'warning': err_read})
+                            sys.stderr.flush()
+                # At this point we have gone through all the possible
+                # descriptors and `read` was empty, so we now can break out of
+                # this since all stdout/stderr has been properly flushed to
+                # logging
+                if not err_read and not out_read:
+                    break
+
+            break
+
+    returncode = process.wait()
+    if returncode != 0:
+        if stop_on_nonzero:
+            raise RuntimeError(
+                "command returned non-zero exit status: %s" % returncode
+            )
+        else:
+            channel.send({'warning': "command returned non-zero exit status: %s" % returncode})
+
+
+def _remote_check(channel, cmd, **kw):
+    import subprocess
+    stdin = kw.pop('stdin', None)
+    process = subprocess.Popen(
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.PIPE, **kw
+    )
+
+    if stdin:
+        if not isinstance(stdin, bytes):
+            stdin.encode('utf-8', errors='ignore')
+        stdout_stream, stderr_stream = process.communicate(stdin)
+    else:
+        stdout_stream = process.stdout.read()
+        stderr_stream = process.stderr.read()
+
+    try:
+        stdout_stream = stdout_stream.decode('utf-8')
+        stderr_stream = stderr_stream.decode('utf-8')
+    except AttributeError:
+        pass
+
+    stdout = stdout_stream.splitlines()
+    stderr = stderr_stream.splitlines()
+    channel.send((stdout, stderr, process.wait()))
 
 
 class BaseConnection(object):
@@ -24,6 +121,11 @@ class BaseConnection(object):
         self.remote_module = None
         self.channel = None
         self.global_timeout = None  # wait for ever
+        self.log_map = {
+            'debug': self.logger.debug,
+            'error': self.logger.error,
+            'warning': self.logger.warning
+        }
 
         self.interpreter = interpreter or 'python%s' % sys.version_info[0]
 
@@ -108,6 +210,12 @@ class BaseConnection(object):
     def execute(self, function, **kw):
         return self.gateway.remote_exec(function, **kw)
 
+    def run(self, **kw):
+        return self.execute(_remote_run, **kw)
+
+    def check(self, **kw):
+        return self.execute(_remote_check, **kw)
+
     def exit(self):
         self.gateway.exit()
 
@@ -128,6 +236,25 @@ class BaseConnection(object):
         else:
             self.remote_module = LegacyModuleExecute(self.gateway, module, self.logger)
         return self.remote_module
+
+    def report(self, result, timeout):
+        try:
+            received = result.receive(timeout)
+            level_received, message = list(received.items())[0]
+            if not isinstance(message, str):
+                message = message.decode('utf-8')
+            self.log_map[level_received](message.strip('\r\n'))
+        except EOFError:
+            raise StopCallback
+        except Exception as err:
+            # the things we need to do here :(
+            # because execnet magic, we cannot catch this as
+            # `except TimeoutError`
+            if err.__class__.__name__ == 'TimeoutError':
+                msg = 'No data was received after %s seconds, disconnecting...' % timeout
+                self.logger.warning(msg)
+                raise StopCallback
+            raise
 
 
 class LegacyModuleExecute(object):

@@ -21,6 +21,7 @@ setup(
     keywords = "remote, commands, unix, ssh, socket, execute, terminal",
     install_requires=[
         'execnet',
+        'kubernetes',
     ] + install_requires,
     long_description = long_description,
     classifiers = [
