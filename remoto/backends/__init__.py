@@ -427,16 +427,25 @@ def get_python_executable(conn):
     """
     # executables in order of preference:
     executables = ['python3', 'python', 'python2.7']
-    for executable in executables:
-        conn.logger.debug('trying to determine remote python executable with %s' % executable)
-        out, err, code = check(conn, ['which', executable])
-        if code:
-            conn.logger.warning('skipping %s, was not found in path' % executable)
-        else:
-            try:
-                return out[0].strip()
-            except IndexError:
-                conn.logger.warning('could not parse stdout: %s' % out)
+    script = '; '.join([
+        'for name in %s' % ' '.join(executables),
+        'do if $name --version 2>/dev/null',
+        'then echo $name',
+        'break',
+        'fi',
+        'done',
+    ])
+    cmd = ['bash', '-c', script]
+    out, err, code = check(conn, cmd)
+    if code:
+        conn.logger.warning(
+            'could not find any executable in path: %s' % ' '.join(executables)
+        )
+    else:
+        try:
+            return out[0].strip()
+        except IndexError:
+            conn.logger.warning('could not parse stdout: %s' % out)
 
     # if all fails, we just return whatever the main connection had
     conn.logger.info('Falling back to using interpreter: %s' % conn.interpreter)
